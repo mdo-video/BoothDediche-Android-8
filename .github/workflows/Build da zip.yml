@@ -1,0 +1,90 @@
+name: Build da zip
+
+# Come si usa: carica nella radice del repo uno zip (es. Booth-android8-modifiche.zip).
+# Il workflow lo scompatta SOPRA il progetto (sovrascrive i file), lo rimuove,
+# fa commit dei file aggiornati, compila gli APK e pubblica la Release v<appVersionCode>.
+on:
+  push:
+    branches: [main]
+    paths: ['*.zip']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-da-zip
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scompatta lo zip sopra il progetto
+        run: |
+          shopt -s nullglob
+          zips=(*.zip)
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "Nessuno zip nella radice: compilo il progetto così com'è."
+            exit 0
+          fi
+          for z in "${zips[@]}"; do
+            echo "== Scompatto $z"
+            unzip -o -q "$z" -d _zip_tmp
+            # se lo zip contiene una sola cartella radice, la "appiattisce"
+            n=$(ls -A _zip_tmp | wc -l)
+            if [ "$n" -eq 1 ] && [ -d "_zip_tmp/$(ls -A _zip_tmp)" ]; then
+              cp -a "_zip_tmp/$(ls -A _zip_tmp)/." .
+            else
+              cp -a _zip_tmp/. .
+            fi
+            rm -rf _zip_tmp
+            git rm -q --cached "$z" 2>/dev/null || true
+            rm -f "$z"
+          done
+
+      - name: Commit dei file aggiornati
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nessuna modifica da committare."
+          else
+            git commit -m "Applica modifiche da zip [skip ci]"
+            git push
+          fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Leggi versione
+        id: ver
+        run: |
+          code=$(grep '^appVersionCode=' gradle.properties | cut -d= -f2 | tr -d '[:space:]')
+          name=$(grep '^appVersionName=' gradle.properties | cut -d= -f2 | tr -d '[:space:]')
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "Versione $name (code $code)"
+
+      - name: Compila gli APK
+        env:
+          UPDATE_TOKEN: ${{ secrets.UPDATE_TOKEN }}
+        run: |
+          if [ -x ./gradlew ]; then G=./gradlew; else G=gradle; fi
+          $G --no-daemon -PupdateToken="$UPDATE_TOKEN" \
+            :camera:assembleDebug :tablet:assembleDebug :control:assembleDebug
+
+      - name: Raccogli gli APK
+        run: |
+          mkdir -p out
+          for m in camera tablet control; do
+            f=$(find "$m/build/outputs/apk" -name '*.apk' | head -n1)
